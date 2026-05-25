@@ -60,6 +60,7 @@
 - Create: `src/xhs_agent/nodes/crawl_node.py`
 - Create: `src/xhs_agent/nodes/extract_node.py`
 - Create: `src/xhs_agent/nodes/classify_node.py`
+- Create: `src/xhs_agent/nodes/question_select_node.py`
 - Create: `src/xhs_agent/nodes/answer_node.py`
 - Create: `src/xhs_agent/nodes/report_node.py`
 
@@ -372,12 +373,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 from rapidocr_onnxruntime import RapidOCR
 
 
 class ImageOcr:
-    def __init__(self) -> None:
+    def __init__(self, cache_dir: str = ".cache/xhs-images") -> None:
         self._engine = RapidOCR()
+        self._cache_dir = Path(cache_dir)
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def download_image(self, url: str, name: str) -> str:
+        suffix = Path(url.split("?")[0]).suffix or ".jpg"
+        path = self._cache_dir / f"{name}{suffix}"
+        response = httpx.get(url, timeout=20)
+        response.raise_for_status()
+        path.write_bytes(response.content)
+        return str(path)
 
     def extract_text(self, image_path: str) -> str:
         result, _ = self._engine(str(Path(image_path)))
@@ -1838,6 +1850,7 @@ git commit -m "feat: add daily runner and cli entry point"
 - Create: `src/xhs_agent/nodes/crawl_node.py`
 - Create: `src/xhs_agent/nodes/extract_node.py`
 - Create: `src/xhs_agent/nodes/classify_node.py`
+- Create: `src/xhs_agent/nodes/question_select_node.py`
 - Create: `src/xhs_agent/nodes/answer_node.py`
 - Create: `src/xhs_agent/nodes/report_node.py`
 - Modify: `src/xhs_agent/storage/repository.py`
@@ -1846,7 +1859,7 @@ git commit -m "feat: add daily runner and cli entry point"
 - Modify: `src/xhs_agent/cli.py`
 - Test: `tests/test_runner.py`
 
-- [ ] **步骤 1：扩展 runner 测试，覆盖按需 OCR 和部分失败标记**
+- [ ] **步骤 1：扩展 runner 测试，覆盖按需 OCR、日期过滤、高频题选择和部分失败标记**
 
 ```python
 def test_daily_runner_marks_partial_failure_when_answer_generation_fails():
@@ -1865,6 +1878,21 @@ def test_daily_runner_marks_partial_failure_when_answer_generation_fails():
 
     assert result["target_date"] == "2026-04-08"
     assert result["warnings"] == ["answer_generation_failed"]
+
+
+def test_crawl_node_skips_posts_without_publish_time():
+    # 发布时间缺失的帖子不能进入目标自然日样本。
+    ...
+
+
+def test_extract_node_downloads_images_only_when_text_has_no_questions():
+    # 正文已有换行列表式题目时不 OCR；正文无题且有图片时下载图片并 OCR。
+    ...
+
+
+def test_question_select_node_answers_global_top_questions_not_first_questions_per_post():
+    # 多篇帖子中的同义题先归并计数，再选择全局重点题进入 AnswerNode。
+    ...
 ```
 
 - [ ] **步骤 2：运行 runner 测试，确认新增场景失败**
@@ -1896,6 +1924,7 @@ class DailyJobState:
     raw_posts: list[dict] = field(default_factory=list)
     extracted_posts: list[dict] = field(default_factory=list)
     enriched_posts: list = field(default_factory=list)
+    selected_questions: list[dict] = field(default_factory=list)
     answer_cards: list[dict] = field(default_factory=list)
     top_posts: list[dict] = field(default_factory=list)
     top_tags: list[tuple[str, int]] = field(default_factory=list)
@@ -1964,12 +1993,15 @@ class CrawlNode:
             try:
                 html = self._browser.open_post_detail(post_url)
                 publish_time = self._browser.extract_publish_time(html)
-                # 时间过滤：只保留目标日期的帖子
-                if publish_time and not publish_time.startswith(state.target_date):
+                # 时间过滤：发布时间缺失或不属于目标日期的帖子都跳过，避免污染自然日样本
+                if not publish_time:
+                    state.warnings.append("publish_time_missing")
+                    continue
+                if not publish_time.startswith(state.target_date):
                     continue
                 post = extract_post_detail(html)
                 post.post_id = str(uuid.uuid4())
-                post.published_date = publish_time or ""
+                post.published_date = publish_time
                 posts.append(
                     {
                         "post_id": post.post_id,
@@ -2005,9 +2037,16 @@ class ExtractNode:
                 continue
 
             candidate_lines = split_to_candidate_lines(item["body_text"])
-            if should_run_ocr(candidate_lines) and item.get("image_text"):
-                ocr_lines = split_to_candidate_lines(item["image_text"])
-                candidate_lines.extend(ocr_lines)
+            if should_run_ocr(candidate_lines):
+                for index, image_url in enumerate(item.get("image_urls", [])):
+                    try:
+                        image_path = self._ocr.download_image(image_url, f"{item['post_id']}-{index}")
+                        image_text = self._ocr.extract_text(image_path)
+                        candidate_lines.extend(split_to_candidate_lines(image_text))
+                    except Exception:
+                        state.warnings.append("ocr_failed")
+                if not candidate_lines:
+                    continue
 
             questions = self._llm.extract_questions(candidate_lines)
             if questions:
@@ -2021,6 +2060,7 @@ from __future__ import annotations
 
 from xhs_agent.crawl.candidate_filter import is_candidate_post
 from xhs_agent.models import RawPost
+from xhs_agent.process.stats import build_tag_counts
 
 
 class ClassifyNode:
@@ -2031,7 +2071,7 @@ class ClassifyNode:
     def run(self, state) -> None:
         enriched_posts = []
         top_posts = []
-        top_tags = []
+        tag_lists = []
         for item in state.extracted_posts:
             if not is_candidate_post(item["title"], item["body_text"]):
                 continue
@@ -2051,10 +2091,52 @@ class ClassifyNode:
                     "questions": enriched.normalized_questions[:3],
                 }
             )
-            top_tags.extend((tag, 1) for tag in enriched.knowledge_tags)
+            tag_lists.append(enriched.knowledge_tags)
         state.enriched_posts = enriched_posts
         state.top_posts = top_posts
-        state.top_tags = top_tags
+        state.top_tags = build_tag_counts(tag_lists)
+```
+
+```python
+# src/xhs_agent/nodes/question_select_node.py
+from __future__ import annotations
+
+from xhs_agent.process.dedupe import dedupe_questions
+
+
+CORE_BACKEND_KEYWORDS = ("Redis", "MySQL", "JVM", "缓存", "消息队列", "分布式", "Spring", "Nginx")
+AI_AGENT_KEYWORDS = ("RAG", "Agent", "LLM", "MCP", "Prompt", "Function Calling", "向量", "Embedding", "Tool")
+
+
+def _question_score(question: str, count: int) -> int:
+    score = count * 10
+    if any(keyword in question for keyword in CORE_BACKEND_KEYWORDS):
+        score += 3
+    if any(keyword in question for keyword in AI_AGENT_KEYWORDS):
+        score += 4
+    return score
+
+
+class QuestionSelectNode:
+    def __init__(self, llm_client, max_questions: int = 8) -> None:
+        self._llm = llm_client
+        self._max_questions = max_questions
+
+    def run(self, state) -> None:
+        all_questions = [
+            question
+            for enriched in state.enriched_posts
+            for question in enriched.normalized_questions
+        ]
+        question_counts = dedupe_questions(all_questions, self._llm)
+        ranked = sorted(
+            question_counts.items(),
+            key=lambda item: (-_question_score(item[0], item[1]), item[0]),
+        )
+        state.selected_questions = [
+            {"question": question, "count": count}
+            for question, count in ranked[: self._max_questions]
+        ]
 ```
 
 ```python
@@ -2068,19 +2150,19 @@ class AnswerNode:
 
     def run(self, state) -> None:
         answer_cards = []
-        for enriched in state.enriched_posts:
+        for item in state.selected_questions:
             try:
-                for question in enriched.normalized_questions[:2]:
-                    card = self._enricher.answer(question)
-                    answer_cards.append(
-                        {
-                            "question": card.question,
-                            "answer": card.answer,
-                            "why_asked": card.why_asked,
-                            "answer_structure": card.answer_structure,
-                            "follow_ups": card.follow_ups,
-                        }
-                    )
+                card = self._enricher.answer(item["question"])
+                answer_cards.append(
+                    {
+                        "question": card.question,
+                        "count": item["count"],
+                        "answer": card.answer,
+                        "why_asked": card.why_asked,
+                        "answer_structure": card.answer_structure,
+                        "follow_ups": card.follow_ups,
+                    }
+                )
             except Exception:
                 state.warnings.append("answer_generation_failed")
         state.answer_cards = answer_cards
@@ -2120,7 +2202,7 @@ class ReportNode:
             valid_count=len(state.enriched_posts),
             question_count=len(state.answer_cards),
             top_tags=state.top_tags[:10],
-            top_questions=[card["question"] for card in state.answer_cards[:8]],
+            top_questions=[item["question"] for item in state.selected_questions],
         )
 
         state.report_markdown = render_daily_report(
@@ -2143,10 +2225,11 @@ from xhs_agent.state import DailyJobState
 
 
 class DailyOrchestrator:
-    def __init__(self, crawl_node, extract_node, classify_node, answer_node, report_node) -> None:
+    def __init__(self, crawl_node, extract_node, classify_node, question_select_node, answer_node, report_node) -> None:
         self._crawl_node = crawl_node
         self._extract_node = extract_node
         self._classify_node = classify_node
+        self._question_select_node = question_select_node
         self._answer_node = answer_node
         self._report_node = report_node
 
@@ -2159,6 +2242,7 @@ class DailyOrchestrator:
         state = DailyJobState(target_date=target_date, raw_posts=posts)
         self._extract_node.run(state)
         self._classify_node.run(state)
+        self._question_select_node.run(state)
         self._answer_node.run(state)
         self._report_node.run(state)
         return {
@@ -2250,6 +2334,7 @@ from xhs_agent.nodes.answer_node import AnswerNode
 from xhs_agent.nodes.classify_node import ClassifyNode
 from xhs_agent.nodes.crawl_node import CrawlNode
 from xhs_agent.nodes.extract_node import ExtractNode
+from xhs_agent.nodes.question_select_node import QuestionSelectNode
 from xhs_agent.nodes.report_node import ReportNode
 from xhs_agent.orchestration.orchestrator import DailyOrchestrator
 from xhs_agent.report.feishu import FeishuDocPublisher
@@ -2290,6 +2375,7 @@ def main() -> None:
             crawl_node=CrawlNode(browser),
             extract_node=ExtractNode(ImageOcr(), llm),
             classify_node=ClassifyNode(enricher, repository),
+            question_select_node=QuestionSelectNode(llm, settings.report_top_questions),
             answer_node=AnswerNode(enricher),
             report_node=ReportNode(repository),
         )
