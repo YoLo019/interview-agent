@@ -274,48 +274,41 @@ git commit -m "chore: bootstrap xhs daily report agent"
 - Create: `src/xhs_agent/ocr/image_ocr.py`
 - Test: `tests/test_line_questions.py`
 
-- [ ] **步骤 1：先写题目提取失败测试，覆盖有编号、无编号、连续描述拒绝和 OCR 触发**
+- [ ] **步骤 1：先写题目提取失败测试，覆盖有编号、无编号、明显非题行排除**
 
 ```python
 # tests/test_line_questions.py
-from xhs_agent.extract.line_questions import extract_question_lines, should_run_ocr
+from xhs_agent.extract.line_questions import split_to_candidate_lines, should_run_ocr
 
 
-def test_extract_question_lines_supports_numbered_and_plain_lines():
+def test_split_to_candidate_lines_handles_numbered_and_plain_lines():
     body = """PDD服务端一面
 
 1. 项目怎么上线，怎么部署
 2. nginx 和 springboot 如何通信
-手撕：数组按 k 分组"""
+手撕：数组按 k 分组
+MySQL 索引原理
+字数 1024
+点赞 32"""
 
-    assert extract_question_lines(body) == [
-        "项目怎么上线，怎么部署",
-        "nginx 和 springboot 如何通信",
-        "手撕：数组按 k 分组",
-    ]
-
-
-def test_extract_question_lines_supports_one_question_per_line_without_numbers():
-    body = """PDD服务端一面
-
-项目怎么上线，怎么部署
-nginx 和 springboot 如何通信
-缓存与 db 一致性，如何确定最终一致"""
-
-    assert extract_question_lines(body) == [
-        "项目怎么上线，怎么部署",
-        "nginx 和 springboot 如何通信",
-        "缓存与 db 一致性，如何确定最终一致",
-    ]
+    result = split_to_candidate_lines(body)
+    assert "项目怎么上线，怎么部署" in result
+    assert "nginx 和 springboot 如何通信" in result
+    assert "手撕：数组按 k 分组" in result
+    assert "MySQL 索引原理" in result
+    # 元数据行不应出现在候选行中
+    assert not any("字数" in line for line in result)
+    assert not any("点赞" in line for line in result)
 
 
-def test_extract_question_lines_rejects_continuous_prose():
-    body = "今天问了 redis 和 mysql，还问了 rag，整体挺散，没有逐行列题。"
+def test_split_to_candidate_lines_filters_too_short_and_too_long():
+    body = "A\nRedis\n非常" + "长" * 300
+    result = split_to_candidate_lines(body)
+    assert "Redis" not in result  # 太短
+    assert not any(len(line) > 200 for line in result)
 
-    assert extract_question_lines(body) == []
 
-
-def test_should_run_ocr_only_when_text_questions_are_missing():
+def test_should_run_ocr_only_when_no_candidate_lines():
     assert should_run_ocr(["项目怎么上线"]) is False
     assert should_run_ocr([]) is True
 ```
@@ -342,22 +335,13 @@ from __future__ import annotations
 
 import re
 
-QUESTION_HINTS = (
-    "为什么",
-    "如何",
-    "怎么",
-    "区别",
-    "原理",
-    "手撕",
-    "设计",
-    "实现",
-    "一致性",
-    "上线",
-    "部署",
-    "通信",
-)
-
 NUMBER_PREFIX_RE = re.compile(r"^\s*(?:\d+[.)、]|[一二三四五六七八九十]+[、.]|\(\d+\))\s*")
+
+# 规则负责快速排除明显非题目的行，LLM 负责最终判定和标准化
+_NOT_A_QUESTION_PATTERN = re.compile(
+    r"^(\d{4}年|字数|阅读|点赞|收藏|分享|发布于|来自|"
+    r"iOS|Android|客户端|iPhone|编辑于|已编辑)",
+)
 
 
 def normalize_question_line(line: str) -> str:
@@ -365,18 +349,17 @@ def normalize_question_line(line: str) -> str:
     return re.sub(r"\s+", " ", line)
 
 
-def looks_like_question_line(line: str) -> bool:
-    if len(line) < 4:
-        return False
-    if "。" in line and "：" not in line and "?" not in line and "？" not in line:
-        return False
-    return any(token in line for token in QUESTION_HINTS)
-
-
-def extract_question_lines(body: str) -> list[str]:
+def split_to_candidate_lines(body: str) -> list[str]:
+    """把正文按换行切分为候选行（仅做最粗的噪音剔除），不做题目判定。"""
     lines = [normalize_question_line(raw) for raw in body.splitlines()]
-    lines = [line for line in lines if line]
-    return [line for line in lines if looks_like_question_line(line)]
+    return [
+        line
+        for line in lines
+        if line
+        and len(line) >= 4
+        and len(line) <= 200
+        and not _NOT_A_QUESTION_PATTERN.match(line)
+    ]
 
 
 def should_run_ocr(question_lines: list[str]) -> bool:
@@ -440,7 +423,7 @@ git commit -m "feat: add newline-list question extraction"
 
 ```python
 # tests/test_candidate_filter.py
-from xhs_agent.crawl.candidate_filter import is_candidate_post
+from xhs_agent.crawl.candidate_filter import is_candidate_post, hard_excluded, has_recall_signal
 
 
 def test_candidate_filter_accepts_backend_interview_titles():
@@ -452,8 +435,13 @@ def test_candidate_filter_accepts_ai_agent_interview_titles():
 
 
 def test_candidate_filter_rejects_excluded_targets():
-    assert is_candidate_post("Golang一面", "项目介绍") is False
+    assert is_candidate_post("Golang 面试 一面", "项目介绍") is False
     assert is_candidate_post("C++面经", "手撕题") is False
+
+
+def test_candidate_filter_no_false_positive_on_go_substring():
+    # "mongodb" 中包含 "go" 不应触发误杀
+    assert hard_excluded("后端面经", "MongoDB 索引原理") is False
 ```
 
 ```python
@@ -521,31 +509,43 @@ class RawPost:
 # src/xhs_agent/crawl/candidate_filter.py
 from __future__ import annotations
 
-EXCLUDED_TOKENS = ("golang", "go ", "c++", "前端", "产品", "运营")
+import re
+
+# 使用正则确保排除词匹配的是独立词，避免子串误杀（如 "mongodb" 匹配 "go"）
+EXCLUDED_PATTERNS = (
+    re.compile(r"\bgolang\b", re.IGNORECASE),
+    re.compile(r"\bgo\b.*\b面试\b", re.IGNORECASE),      # "go 面试" 类标题
+    re.compile(r"\bgolang\b.*\b面经\b", re.IGNORECASE),
+    re.compile(r"\bc\+\+\b", re.IGNORECASE),
+    re.compile(r"前端"),
+    re.compile(r"产品经理"),
+    re.compile(r"运营"),
+)
+
 RECALL_TOKENS = (
-    "后端",
-    "服务端",
-    "java",
-    "面经",
-    "一面",
-    "二面",
-    "终面",
-    "手撕",
-    "redis",
-    "mysql",
-    "jvm",
-    "rag",
-    "agent",
-    "llm",
-    "mcp",
+    "后端", "服务端", "java", "面经", "一面", "二面", "终面", "手撕",
+    "redis", "mysql", "jvm", "rag", "agent", "llm", "mcp",
+    "面试", "面试官", "八股", "校招", "社招",
 )
 
 
-def is_candidate_post(title: str, preview_text: str) -> bool:
-    haystack = f"{title}\n{preview_text}".lower()
-    if any(token in haystack for token in EXCLUDED_TOKENS):
-        return False
+def hard_excluded(title: str, body_text: str) -> bool:
+    """第一级硬排除：文本是否明确属于非目标岗位。"""
+    haystack = f"{title}\n{body_text}"
+    return any(pattern.search(haystack) for pattern in EXCLUDED_PATTERNS)
+
+
+def has_recall_signal(title: str, body_text: str) -> bool:
+    """文本是否包含至少一个召回信号（关键词或面试信号词）。"""
+    haystack = f"{title}\n{body_text}".lower()
     return any(token in haystack for token in RECALL_TOKENS)
+
+
+def is_candidate_post(title: str, preview_text: str) -> bool:
+    """组合判定：先排除，再检查信号。"""
+    if hard_excluded(title, preview_text):
+        return False
+    return has_recall_signal(title, preview_text)
 ```
 
 ```python
@@ -574,25 +574,93 @@ def extract_post_detail(html: str) -> RawPost:
 # src/xhs_agent/crawl/browser.py
 from __future__ import annotations
 
+import re
+import time
 from pathlib import Path
+from urllib.parse import quote
 
 from playwright.sync_api import Page, sync_playwright
 
 
 class BrowserSession:
+    """维护单个浏览器实例和登录态，支持搜索、翻页、打开详情页。"""
+
+    SEARCH_URL = "https://www.xiaohongshu.com/search_result?keyword={keyword}&sort=time"
+
     def __init__(self, storage_state_path: str) -> None:
         self.storage_state_path = storage_state_path
+        self._playwright = None
+        self._browser = None
+        self._context = None
 
-    def open_page(self, url: str) -> str:
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
-            context = browser.new_context(storage_state=str(Path(self.storage_state_path)))
-            page: Page = context.new_page()
-            page.goto(url, wait_until="networkidle")
-            html = page.content()
-            context.close()
-            browser.close()
-            return html
+    def __enter__(self):
+        self._playwright = sync_playwright().start()
+        self._browser = self._playwright.chromium.launch(headless=True)
+        self._context = self._browser.new_context(
+            storage_state=str(Path(self.storage_state_path)),
+            viewport={"width": 1280, "height": 800},
+        )
+        return self
+
+    def __exit__(self, *args):
+        if self._context:
+            self._context.close()
+        if self._browser:
+            self._browser.close()
+        if self._playwright:
+            self._playwright.stop()
+
+    def _new_page(self) -> Page:
+        return self._context.new_page()
+
+    def search_posts(self, keyword: str, max_scrolls: int = 5) -> list[str]:
+        """搜索关键词并返回帖子 URL 列表（已去重）。"""
+        page = self._new_page()
+        url = self.SEARCH_URL.format(keyword=quote(keyword))
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        time.sleep(2)  # 等待动态内容渲染
+
+        collected: set[str] = set()
+        for _ in range(max_scrolls):
+            page.evaluate("window.scrollBy(0, 800)")
+            time.sleep(1.5)
+            links = page.eval_on_selector_all(
+                'a[href*="/explore/"]',
+                "els => els.map(el => el.href)",
+            )
+            collected.update(links)
+
+        page.close()
+        return list(collected)
+
+    def open_post_detail(self, post_url: str) -> str:
+        """打开帖子详情页并返回完整 HTML。"""
+        page = self._new_page()
+        page.goto(post_url, wait_until="networkidle", timeout=30000)
+        time.sleep(1)
+        html = page.content()
+        page.close()
+        return html
+
+    def extract_publish_time(self, html: str) -> str | None:
+        """从详情页 HTML 中提取发布时间字符串。"""
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        time_meta = soup.select_one('meta[itemprop="datePublished"]')
+        if time_meta:
+            return time_meta.get("content")
+        # 备选：匹配页面中的时间文本
+        match = re.search(r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})', html)
+        return match.group(1) if match else None
+
+    def verify_login(self) -> bool:
+        """检查登录态是否仍然有效。"""
+        page = self._new_page()
+        page.goto("https://www.xiaohongshu.com", wait_until="networkidle", timeout=15000)
+        html = page.content()
+        page.close()
+        # 未登录时页面标题不包含用户相关元素
+        return "login" not in html.lower()[:2000] and "验证" not in html[:2000]
 ```
 
 - [ ] **步骤 4：再次运行解析层测试，确认通过**
@@ -708,46 +776,113 @@ import json
 
 from openai import OpenAI
 
+from xhs_agent.llm.prompts import (
+    ANSWER_PROMPT,
+    CLASSIFY_AND_ENRICH_PROMPT,
+    EXTRACT_QUESTIONS_PROMPT,
+)
+
 
 class LlmClient:
     def __init__(self, api_key: str, model: str = "gpt-5.2") -> None:
         self._client = OpenAI(api_key=api_key)
         self._model = model
 
-    def classify_and_enrich(self, title: str, questions: list[str]) -> dict:
-        prompt = f"Title: {title}\nQuestions:\n" + "\n".join(f"- {q}" for q in questions)
+    def _call_json(self, system_prompt: str, user_input: str) -> dict:
         response = self._client.responses.create(
             model=self._model,
-            input=prompt,
+            instructions=system_prompt,
+            input=user_input,
             text={"format": {"type": "json_object"}},
         )
         return json.loads(response.output_text)
 
-    def answer_question(self, question: str) -> dict:
-        response = self._client.responses.create(
-            model=self._model,
-            input=question,
-            text={"format": {"type": "json_object"}},
+    def extract_questions(self, candidate_lines: list[str]) -> list[str]:
+        if not candidate_lines:
+            return []
+        payload = self._call_json(
+            EXTRACT_QUESTIONS_PROMPT,
+            "\n".join(f"- {line}" for line in candidate_lines),
         )
-        return json.loads(response.output_text)
+        return payload.get("questions", [])
+
+    def classify_and_enrich(self, title: str, questions: list[str]) -> dict:
+        user_input = f"Title: {title}\nQuestions:\n" + "\n".join(f"- {q}" for q in questions)
+        return self._call_json(CLASSIFY_AND_ENRICH_PROMPT, user_input)
+
+    def answer_question(self, question: str) -> dict:
+        return self._call_json(ANSWER_PROMPT, question)
 ```
 
 ```python
 # src/xhs_agent/llm/prompts.py
+EXTRACT_QUESTIONS_PROMPT = """
+You are extracting interview questions from Xiaohongshu posts.
+
+Given a list of candidate lines from a post body, return ONLY the lines that are interview questions.
+Interview questions include:
+- Technical questions (e.g. "MySQL 索引原理", "缓存穿透怎么解决", "手撕：LRU")
+- Coding tasks (e.g. "编程题：实现 LRU 缓存", "手撕：数组按 k 分组")
+- Scenario/design questions (e.g. "设计一个短链接系统", "秒杀系统怎么设计")
+- Behavioral and project questions (e.g. "项目怎么上线部署", "介绍你做过的最有挑战的项目")
+- Question-like statements (e.g. "nginx 和 springboot 如何通信", "Redis 为什么快")
+
+NOT interview questions:
+- Post titles and metadata (e.g. "PDD 服务端一面", "2024 校招", "base 上海")
+- Sentiment or summary statements (e.g. "今天面试不太难", "HR 说一周内给结果")
+- Single-word topics without context (e.g. "Redis", "八股")
+
+Return a JSON object with a single field "questions" containing the extracted question lines.
+If no questions found, return {"questions": []}.
+"""
+
 CLASSIFY_AND_ENRICH_PROMPT = """
-You classify Xiaohongshu interview posts.
-Allowed categories: backend, ai_agent, reject.
-Reject Go, Golang, C++.
-Only use facts present in the title and question lines.
-Return JSON with company_name, round_name, normalized_questions, knowledge_tags.
+You classify Xiaohongshu interview posts and extract structured information.
+
+Allowed categories: "backend", "ai_agent", "reject".
+
+Reject if the post is primarily about: Go, Golang, C++, front-end, PM, operations.
+Only use facts present in the title and extracted question lines.
+Never invent company names, rounds, or topics that are not explicitly mentioned.
+
+Return JSON:
+{
+  "category": "backend" | "ai_agent" | "reject",
+  "company_name": "company name or empty string",
+  "round_name": "e.g. 一面, 二面, 三面, 终面, HR面, or empty string",
+  "normalized_questions": ["question 1", "question 2"],
+  "knowledge_tags": ["tag1", "tag2"]
+}
+
+When normalizing questions:
+- Expand abbreviations (db→数据库, mq→消息队列)
+- Fix obvious typos
+- Keep the original meaning intact
+- If a question is too vague to understand, mark it "[ambiguous] question text"
+
+Tags should be specific technical topics: e.g. "MySQL", "Redis", "RAG", "缓存", "分布式", "Spring"
 """
 
 ANSWER_PROMPT = """
-Return a standard interview answer in JSON.
-Fields: question, answer, why_asked, answer_structure, follow_ups.
-Keep the answer concise and directly useful for interview prep.
+You are writing a standard interview answer in Chinese. 
+
+Provide an answer that:
+- Leads with the key conclusion first (30-50 words)
+- Explains the core principle or approach (80-150 words)
+- Covers practical considerations and trade-offs where relevant
+- Ends with a brief summary
+
+The answer should be concise enough to recite in 3-5 minutes in an interview, but detailed enough to demonstrate deep understanding.
+
+Return JSON:
+{
+  "question": "original question",
+  "answer": "complete answer in Chinese",
+  "why_asked": "what the interviewer is testing with this question",
+  "answer_structure": ["step1", "step2", "step3"],
+  "follow_ups": ["common follow-up question 1", "follow-up question 2"]
+}
 """
-```
 
 ```python
 # src/xhs_agent/process/enricher.py
@@ -755,9 +890,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from xhs_agent.crawl.candidate_filter import hard_excluded
 from xhs_agent.models import RawPost
-
-EXCLUDED_TITLE_TOKENS = ("golang", "go ", "c++")
 
 
 @dataclass(slots=True)
@@ -786,7 +920,7 @@ class Enricher:
         self._llm = llm_client
 
     def is_supported_post(self, post: RawPost) -> bool:
-        return not any(token in post.title.lower() for token in EXCLUDED_TITLE_TOKENS)
+        return not hard_excluded(post.title, post.body_text)
 
     def enrich(self, post: RawPost, post_questions: list[str]) -> EnrichedPost:
         payload = self._llm.classify_and_enrich(post.title, post_questions)
@@ -848,21 +982,8 @@ git commit -m "feat: add llm enrichment and answer generation"
 
 ```python
 # tests/test_repository_and_stats.py
-from xhs_agent.process.dedupe import dedupe_questions
-from xhs_agent.process.stats import build_tag_counts
-
-
-def test_dedupe_questions_merges_simple_synonyms():
-    questions = [
-        "Redis 为什么快？",
-        "为什么 Redis 这么快？",
-        "MySQL 索引失效场景有哪些？",
-    ]
-
-    result = dedupe_questions(questions)
-
-    assert result["Redis 为什么快？"] == 2
-    assert result["MySQL 索引失效场景有哪些？"] == 1
+from datetime import date, timedelta
+from xhs_agent.process.stats import build_tag_counts, compute_trend_lines
 
 
 def test_build_tag_counts_returns_descending_frequency():
@@ -875,6 +996,22 @@ def test_build_tag_counts_returns_descending_frequency():
     )
 
     assert counts == [("Redis", 2), ("MySQL", 2), ("缓存", 1)]
+
+
+def test_compute_trend_lines_detects_surge():
+    target = (date.today() - timedelta(days=1)).isoformat()
+
+    class FakeRepo:
+        def tag_counts_for_date_range(self, start, end):
+            # 历史 7 天中 RAG 总量为 6，日均 ~1
+            return {"2026-04-01": [("RAG", 1)], "2026-04-02": [("RAG", 2)], "2026-04-03": [("RAG", 0)],
+                    "2026-04-04": [("RAG", 1)], "2026-04-05": [("RAG", 1)], "2026-04-06": [("RAG", 1)]}
+
+    current = [("RAG", 5), ("Redis", 3)]
+    lines = compute_trend_lines(target, current, FakeRepo())
+
+    # RAG 当天 5 次，历史日均 ~1 → 应该被检测为升温
+    assert any("RAG" in line for line in lines)
 ```
 
 - [ ] **步骤 2：运行存储和统计测试，确认失败**
@@ -915,16 +1052,34 @@ CREATE TABLE IF NOT EXISTS raw_posts (
 CREATE TABLE IF NOT EXISTS normalized_questions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     post_id TEXT NOT NULL,
+    target_date TEXT NOT NULL,
     question_text TEXT NOT NULL,
+    UNIQUE(post_id, question_text),
     FOREIGN KEY(post_id) REFERENCES raw_posts(post_id)
 );
 
 CREATE TABLE IF NOT EXISTS knowledge_tags (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     post_id TEXT NOT NULL,
+    target_date TEXT NOT NULL,
     tag TEXT NOT NULL,
+    UNIQUE(post_id, tag),
     FOREIGN KEY(post_id) REFERENCES raw_posts(post_id)
 );
+
+CREATE TABLE IF NOT EXISTS daily_snapshots (
+    target_date TEXT PRIMARY KEY,
+    candidate_count INTEGER NOT NULL,
+    valid_count INTEGER NOT NULL,
+    question_count INTEGER NOT NULL,
+    top_tags_json TEXT NOT NULL DEFAULT '[]',
+    top_questions_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_questions_date ON normalized_questions(target_date);
+CREATE INDEX IF NOT EXISTS idx_tags_date ON knowledge_tags(target_date);
+CREATE INDEX IF NOT EXISTS idx_posts_date ON raw_posts(target_date);
 """
 
 
@@ -939,6 +1094,7 @@ def connect(db_path: str) -> sqlite3.Connection:
 # src/xhs_agent/storage/repository.py
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from xhs_agent.process.enricher import EnrichedPost
@@ -947,6 +1103,8 @@ from xhs_agent.process.enricher import EnrichedPost
 class Repository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._connection = connection
+
+    # ---------- 写入 ----------
 
     def save_post(self, target_date: str, post: EnrichedPost) -> None:
         self._connection.execute(
@@ -965,38 +1123,156 @@ class Repository:
             ),
         )
         self._connection.executemany(
-            "INSERT INTO normalized_questions (post_id, question_text) VALUES (?, ?)",
-            [(post.post_id, question) for question in post.normalized_questions],
+            "INSERT OR IGNORE INTO normalized_questions (post_id, target_date, question_text) VALUES (?, ?, ?)",
+            [(post.post_id, target_date, question) for question in post.normalized_questions],
         )
         self._connection.executemany(
-            "INSERT INTO knowledge_tags (post_id, tag) VALUES (?, ?)",
-            [(post.post_id, tag) for tag in post.knowledge_tags],
+            "INSERT OR IGNORE INTO knowledge_tags (post_id, target_date, tag) VALUES (?, ?, ?)",
+            [(post.post_id, target_date, tag) for tag in post.knowledge_tags],
         )
         self._connection.commit()
+
+    def save_daily_snapshot(
+        self, target_date: str, candidate_count: int, valid_count: int,
+        question_count: int, top_tags: list[tuple[str, int]], top_questions: list[str],
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT OR REPLACE INTO daily_snapshots (target_date, candidate_count, valid_count, question_count, top_tags_json, top_questions_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (target_date, candidate_count, valid_count, question_count, json.dumps(top_tags), json.dumps(top_questions)),
+        )
+        self._connection.commit()
+
+    # ---------- 当日查询 ----------
+
+    def count_posts_for_date(self, target_date: str) -> int:
+        row = self._connection.execute(
+            "SELECT COUNT(*) FROM raw_posts WHERE target_date = ?", (target_date,)
+        ).fetchone()
+        return row[0] if row else 0
+
+    def count_questions_for_date(self, target_date: str) -> int:
+        row = self._connection.execute(
+            "SELECT COUNT(*) FROM normalized_questions WHERE target_date = ?", (target_date,)
+        ).fetchone()
+        return row[0] if row else 0
+
+    def tag_counts_for_date(self, target_date: str) -> list[tuple[str, int]]:
+        rows = self._connection.execute(
+            """
+            SELECT tag, COUNT(*) as cnt FROM knowledge_tags
+            WHERE target_date = ?
+            GROUP BY tag ORDER BY cnt DESC, tag ASC
+            """,
+            (target_date,),
+        ).fetchall()
+        return [(row[0], row[1]) for row in rows]
+
+    # ---------- 跨天趋势查询 ----------
+
+    def tag_counts_for_date_range(self, start_date: str, end_date: str) -> dict[str, list[tuple[str, int]]]:
+        """返回 {日期: [(tag, count), ...]} 供趋势分析使用。"""
+        rows = self._connection.execute(
+            """
+            SELECT target_date, tag, COUNT(*) as cnt FROM knowledge_tags
+            WHERE target_date >= ? AND target_date <= ?
+            GROUP BY target_date, tag ORDER BY target_date DESC, cnt DESC
+            """,
+            (start_date, end_date),
+        ).fetchall()
+        result: dict[str, list[tuple[str, int]]] = {}
+        for date, tag, cnt in rows:
+            result.setdefault(date, []).append((tag, cnt))
+        return result
+
+    def question_counts_for_date_range(self, start_date: str, end_date: str) -> dict[str, int]:
+        rows = self._connection.execute(
+            """
+            SELECT target_date, COUNT(*) FROM normalized_questions
+            WHERE target_date >= ? AND target_date <= ?
+            GROUP BY target_date
+            """,
+            (start_date, end_date),
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def post_company_summary_for_date(self, target_date: str) -> list[tuple[str, int]]:
+        """统计当天每家公司的帖子数，用于重点观察中的异常检测。"""
+        rows = self._connection.execute(
+            """
+            SELECT company_name, COUNT(*) FROM raw_posts
+            WHERE target_date = ? AND company_name IS NOT NULL AND company_name != ''
+            GROUP BY company_name ORDER BY COUNT(*) DESC
+            """,
+            (target_date,),
+        ).fetchall()
+        return [(row[0], row[1]) for row in rows]
 ```
 
 ```python
 # src/xhs_agent/process/dedupe.py
 from __future__ import annotations
 
-
-def canonicalize(question: str) -> str:
-    return question.replace("这么", "").replace("？", "?").replace(" ?", "?").strip()
+import json
 
 
-def dedupe_questions(questions: list[str]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    aliases: dict[str, str] = {}
-    for question in questions:
-        key = canonicalize(question)
-        canonical = aliases.setdefault(key, question)
-        counts[canonical] = counts.get(canonical, 0) + 1
-    return counts
+DEDUPE_PROMPT = """
+You are merging near-duplicate interview questions.
+
+Given a list of questions, group questions that ask the same thing (even if phrased differently) and pick the best representative text for each group.
+
+Examples of questions that should be merged:
+- "Redis 为什么快" and "为什么 Redis 这么快" → same question
+- "MySQL 索引失效场景有哪些" and "哪些情况会导致 MySQL 索引失效" → same question
+- "缓存和 DB 一致性怎么保证" and "如何保证缓存与数据库的一致性" → same question
+- "RAG 召回怎么优化" and "怎么提升 RAG 的召回效果" → same question
+
+Examples that should NOT be merged:
+- "Redis 为什么快" and "Redis 持久化机制" → different topics
+- "MySQL 索引原理" and "MySQL 索引失效场景" → related but different questions
+
+Return JSON with a single field "groups" — a list of groups, each with:
+- "representative": the best representative text for the group
+- "count": how many questions are in the group
+- "members": list of all questions in the group
+
+Input:
+"""
+
+
+def dedupe_questions(questions: list[str], llm_client) -> dict[str, int]:
+    """使用 LLM 语义去重，返回 {代表题目: 出现次数}。"""
+    if len(questions) <= 1:
+        return {q: 1 for q in questions}
+
+    user_input = "\n".join(f"- {q}" for q in questions)
+    try:
+        response = llm_client._client.responses.create(
+            model=llm_client._model,
+            instructions=DEDUPE_PROMPT,
+            input=user_input,
+            text={"format": {"type": "json_object"}},
+        )
+        payload = json.loads(response.output_text)
+        return {
+            group["representative"]: group["count"]
+            for group in payload.get("groups", [])
+        }
+    except Exception:
+        # 降级：简单计数
+        counts: dict[str, int] = {}
+        for q in questions:
+            counts[q] = counts.get(q, 0) + 1
+        return counts
 ```
 
 ```python
 # src/xhs_agent/process/stats.py
 from __future__ import annotations
+
+from datetime import date, timedelta
 
 
 def build_tag_counts(tag_lists: list[list[str]]) -> list[tuple[str, int]]:
@@ -1005,6 +1281,80 @@ def build_tag_counts(tag_lists: list[list[str]]) -> list[tuple[str, int]]:
         for tag in tags:
             counts[tag] = counts.get(tag, 0) + 1
     return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+
+
+def compute_trend_lines(
+    target_date: str,
+    current_tags: list[tuple[str, int]],
+    repository,
+) -> list[str]:
+    """对比近 7 天历史，发现升温知识点，返回趋势描述行列表。"""
+    try:
+        end = date.fromisoformat(target_date)
+        start = end - timedelta(days=7)
+        history = repository.tag_counts_for_date_range(start.isoformat(), end.isoformat())
+
+        # 合并历史计数
+        historical_counts: dict[str, int] = {}
+        for day_tags in history.values():
+            for tag, cnt in day_tags:
+                historical_counts[tag] = historical_counts.get(tag, 0) + cnt
+
+        trend_lines = []
+        current_map = dict(current_tags)
+        for tag, today_cnt in current_tags[:10]:
+            hist_cnt = historical_counts.get(tag, 0)
+            # 去掉当天后算日均
+            avg = max(hist_cnt - today_cnt, 0) / max(len(history) - 1, 1)
+            if avg > 0 and today_cnt > avg * 1.5:
+                trend_lines.append(f"{tag} 当天出现 {today_cnt} 次，高于近 7 天日均 {avg:.1f} 次")
+
+        # AI/Agent 题占比变化
+        ai_tags = {"RAG", "Agent", "LLM", "MCP", "Prompt", "Function Calling", "向量数据库", "Embedding", "Tool Calling", "Memory", "工作流", "评测", "观测"}
+        today_ai = sum(cnt for tag, cnt in current_tags if tag in ai_tags)
+        today_total = sum(cnt for _, cnt in current_tags)
+        hist_ai = sum(cnt for tag, cnt in historical_counts.items() if tag in ai_tags)
+        hist_total = sum(historical_counts.values())
+        if today_total > 0 and hist_total > 0:
+            today_ratio = today_ai / today_total * 100
+            hist_ratio = hist_ai / hist_total * 100
+            if today_ratio > hist_ratio + 5:
+                trend_lines.append(f"AI/Agent 相关题占比 {today_ratio:.0f}%，较近 7 天均值 {hist_ratio:.0f}% 明显上升")
+
+        return trend_lines
+    except Exception:
+        return []
+
+
+def compute_observation_lines(
+    target_date: str,
+    company_summary: list[tuple[str, int]],
+    current_tags: list[tuple[str, int]],
+    repository,
+) -> list[str]:
+    """生成重点观察结论。"""
+    lines = []
+
+    # 某公司当天出现多篇面经
+    for company, cnt in company_summary[:5]:
+        if cnt >= 2:
+            lines.append(f"{company} 当天出现 {cnt} 篇面经")
+
+    # 尝试检测连续天数高频
+    try:
+        tag_set = {tag for tag, _ in current_tags[:8]}
+        end = date.fromisoformat(target_date)
+        start = end - timedelta(days=3)
+        recent = repository.tag_counts_for_date_range(start.isoformat(), end.isoformat())
+        for tag in tag_set:
+            days_seen = sum(1 for day_tags in recent.values() if tag in dict(day_tags))
+            if days_seen >= 3:
+                lines.append(f"{tag} 连续 {days_seen} 天高频出现")
+                break
+    except Exception:
+        pass
+
+    return lines[:5]  # 最多 5 条
 ```
 
 - [ ] **步骤 4：再次运行存储和统计测试，确认通过**
@@ -1066,11 +1416,14 @@ def test_render_daily_report_contains_required_sections():
         ],
         trend_lines=["RAG 评测题开始升温"],
         observation_lines=["PDD 当天出现 2 篇相似面经"],
+        candidate_count=15,
+        valid_count=5,
     )
 
     assert "4月8日 小红书后端 / AI 应用开发面经日报" in report
     assert "## 今日概览" in report
     assert "## 高频题目与标准回答" in report
+    assert "15" in report  # candidate_count 显示在概览中
 ```
 
 - [ ] **步骤 2：运行日报渲染测试，确认失败**
@@ -1102,12 +1455,16 @@ def render_daily_report(
     answered_questions: list[dict],
     trend_lines: list[str],
     observation_lines: list[str],
+    candidate_count: int = 0,
+    valid_count: int = 0,
 ) -> str:
     month, day = target_date.split("-")[1:]
     lines = [
         f"# {int(month)}月{int(day)}日 小红书后端 / AI 应用开发面经日报",
         "",
         "## 今日概览",
+        f"- 候选帖子数：{candidate_count}",
+        f"- 有效面经数：{valid_count}",
         f"- 入选重点面经：{len(top_posts)}",
         f"- 入选重点题目：{len(answered_questions)}",
         "",
@@ -1126,9 +1483,15 @@ def render_daily_report(
         lines.append(f"- 回答结构：{' / '.join(item['answer_structure'])}")
         lines.append(f"- 常见追问：{'；'.join(item['follow_ups'])}")
     lines.extend(["", "## 趋势变化"])
-    lines.extend(f"- {line}" for line in trend_lines)
+    if trend_lines:
+        lines.extend(f"- {line}" for line in trend_lines)
+    else:
+        lines.append("- 暂无足够历史数据用于趋势分析")
     lines.extend(["", "## 重点观察"])
-    lines.extend(f"- {line}" for line in observation_lines)
+    if observation_lines:
+        lines.extend(f"- {line}" for line in observation_lines)
+    else:
+        lines.append("- 本期无特别观察")
     return "\n".join(lines)
 ```
 
@@ -1138,11 +1501,22 @@ from __future__ import annotations
 
 import httpx
 
+# 飞书文档 Block 类型常量
+BLOCK_PAGE = 1
+BLOCK_TEXT = 2
+BLOCK_HEADING_1 = 3
+BLOCK_HEADING_2 = 4
+BLOCK_HEADING_3 = 5
+BLOCK_BULLET = 9
+BLOCK_ORDERED_LIST = 10
+BLOCK_DIVIDER = 18
+
 
 class FeishuDocPublisher:
-    def __init__(self, app_id: str, app_secret: str) -> None:
+    def __init__(self, app_id: str, app_secret: str, parent_folder_token: str) -> None:
         self._app_id = app_id
         self._app_secret = app_secret
+        self._parent_folder_token = parent_folder_token
 
     def _tenant_access_token(self) -> str:
         response = httpx.post(
@@ -1153,40 +1527,102 @@ class FeishuDocPublisher:
         response.raise_for_status()
         return response.json()["tenant_access_token"]
 
-    def publish_markdown(self, title: str, markdown: str) -> dict:
-        token = self._tenant_access_token()
-        headers = {"Authorization": f"Bearer {token}"}
-        response = httpx.post(
-            "https://open.feishu.cn/open-apis/docx/v1/documents",
-            headers=headers,
-            json={"title": title},
-            timeout=30,
-        )
-        response.raise_for_status()
-        document_id = response.json()["data"]["document"]["document_id"]
-        block_response = httpx.post(
-            f"https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks/{document_id}/children",
-            headers=headers,
-            json={
-                "children": [
-                    {
-                        "block_type": 2,
-                        "paragraph": {
-                            "elements": [
-                                {
-                                    "text_run": {
-                                        "content": markdown,
-                                    }
-                                }
-                            ]
-                        },
-                    }
-                ]
+    def _api_headers(self) -> dict:
+        return {"Authorization": f"Bearer {self._tenant_access_token()}", "Content-Type": "application/json"}
+
+    def publish_markdown(self, title: str, markdown: str, max_retries: int = 3) -> dict:
+        """解析 Markdown 为飞书 Block 并发布为飞书文档（支持自动重试）。"""
+        import time
+
+        blocks = self._markdown_to_blocks(markdown)
+        if not blocks:
+            raise ValueError("no blocks to publish")
+
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                token = self._api_headers()
+
+                # 创建文档并放入指定文件夹
+                response = httpx.post(
+                    "https://open.feishu.cn/open-apis/docx/v1/documents",
+                    headers=token,
+                    json={"title": title, "folder_token": self._parent_folder_token},
+                    timeout=30,
+                )
+                response.raise_for_status()
+                document_id = response.json()["data"]["document"]["document_id"]
+
+                # 分批次写入 blocks（飞书 API 单次限制 50 个 block）
+                BATCH_SIZE = 50
+                for i in range(0, len(blocks), BATCH_SIZE):
+                    batch = blocks[i:i + BATCH_SIZE]
+                    httpx.post(
+                        f"https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks/{document_id}/children",
+                        headers=token,
+                        json={"children": batch},
+                        timeout=60,
+                    ).raise_for_status()
+
+                doc_url = f"https://feishu.cn/docx/{document_id}"
+                return {"document_id": document_id, "url": doc_url}
+
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                continue
+
+        raise RuntimeError(f"feishu publish failed after {max_retries} attempts: {last_error}")
+
+    def _markdown_to_blocks(self, markdown: str) -> list[dict]:
+        """将 Markdown 文本转换为飞书 Block 列表。"""
+        blocks: list[dict] = []
+        for line in markdown.split("\n"):
+            block = self._line_to_block(line)
+            if block is not None:
+                blocks.append(block)
+        return blocks
+
+    def _line_to_block(self, line: str) -> dict | None:
+        stripped = line.strip()
+        if not stripped:
+            return None
+
+        if stripped.startswith("### "):
+            return self._heading_block(BLOCK_HEADING_3, stripped[4:])
+        if stripped.startswith("## "):
+            return self._heading_block(BLOCK_HEADING_2, stripped[3:])
+        if stripped.startswith("# "):
+            return self._heading_block(BLOCK_HEADING_1, stripped[2:])
+        if stripped.startswith("- "):
+            return self._bullet_block(stripped[2:])
+
+        return self._text_block(stripped)
+
+    def _heading_block(self, block_type: int, text: str) -> dict:
+        return {
+            "block_type": block_type,
+            f"heading{block_type - 2}": {
+                "elements": [{"text_run": {"content": text}}],
             },
-            timeout=30,
-        )
-        block_response.raise_for_status()
-        return {"document_id": document_id}
+        }
+
+    def _text_block(self, text: str) -> dict:
+        return {
+            "block_type": BLOCK_TEXT,
+            "text": {
+                "elements": [{"text_run": {"content": text}}],
+            },
+        }
+
+    def _bullet_block(self, text: str) -> dict:
+        return {
+            "block_type": BLOCK_BULLET,
+            "bullet": {
+                "elements": [{"text_run": {"content": text}}],
+            },
+        }
 ```
 
 - [ ] **步骤 4：再次运行日报渲染测试，确认通过**
@@ -1263,6 +1699,19 @@ def test_daily_runner_uses_previous_day_window():
 
     assert result["target_date"] == "2026-04-08"
     assert "top_posts" in result
+    assert result.get("warnings") is not None
+
+
+def test_daily_runner_survives_crawl_failure():
+    class BrokenCrawler:
+        def fetch_posts_for_date(self, target_date):
+            raise RuntimeError("network unreachable")
+
+    result = DailyRunner(BrokenCrawler(), FakePipeline()).run(run_date="2026-04-09")
+
+    assert result["target_date"] == "2026-04-08"
+    assert result["warnings"] == ["crawl_failed"]
+    assert result["top_posts"] == []
 ```
 
 - [ ] **步骤 2：运行 runner 测试，确认失败**
@@ -1454,11 +1903,34 @@ class DailyJobState:
     observation_lines: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     report_markdown: str = ""
+    report_url: str = ""
+    dedupe_map: dict[str, int] | None = None
 ```
 
 ```python
 # src/xhs_agent/nodes/crawl_node.py
 from __future__ import annotations
+
+import random
+import uuid
+
+from xhs_agent.crawl.html_extract import extract_post_detail
+
+# 固定搜索词（每轮全部使用）
+FIXED_QUERIES = [
+    "后端面经", "后端面试", "服务端面经", "Java 面经",
+    "AI 应用开发 面经", "Agent 面经", "LLM 面经", "RAG 面经",
+]
+
+# 锚定搜索词池（每轮随机抽 3 个）
+ANCHOR_QUERIES_POOL = [
+    "Redis 面试", "MySQL 面试", "分布式 面试", "JVM 面试",
+    "MQ 面试", "微服务 面试", "MCP 面试", "Function Calling 面试",
+    "Prompt 面试", "向量数据库 面试",
+]
+
+MAX_CANDIDATE_URLS = 200
+MAX_DETAIL_PAGES = 100
 
 
 class CrawlNode:
@@ -1466,28 +1938,80 @@ class CrawlNode:
         self._browser = browser
 
     def run(self, state) -> None:
-        state.raw_posts = []
+        if not self._browser.verify_login():
+            state.warnings.append("login_expired")
+            return
+
+        all_urls: set[str] = set()
+
+        # 阶段 1：用固定搜索词搜索
+        for query in FIXED_QUERIES:
+            urls = self._browser.search_posts(query, max_scrolls=3)
+            all_urls.update(urls)
+            if len(all_urls) >= MAX_CANDIDATE_URLS:
+                break
+
+        # 阶段 2：用随机锚定搜索词搜索
+        anchor_queries = random.sample(ANCHOR_QUERIES_POOL, k=min(3, len(ANCHOR_QUERIES_POOL)))
+        for query in anchor_queries:
+            urls = self._browser.search_posts(query, max_scrolls=3)
+            all_urls.update(urls)
+
+        # 阶段 3：打开详情页提取内容，并用目标日期过滤
+        posts = []
+        urls_to_fetch = list(all_urls)[:MAX_DETAIL_PAGES]
+        for post_url in urls_to_fetch:
+            try:
+                html = self._browser.open_post_detail(post_url)
+                publish_time = self._browser.extract_publish_time(html)
+                # 时间过滤：只保留目标日期的帖子
+                if publish_time and not publish_time.startswith(state.target_date):
+                    continue
+                post = extract_post_detail(html)
+                post.post_id = str(uuid.uuid4())
+                post.published_date = publish_time or ""
+                posts.append(
+                    {
+                        "post_id": post.post_id,
+                        "title": post.title,
+                        "body_text": post.body_text,
+                        "image_urls": post.image_urls,
+                        "published_date": post.published_date,
+                    }
+                )
+            except Exception:
+                continue
+        state.raw_posts = posts
 ```
 
 ```python
 # src/xhs_agent/nodes/extract_node.py
 from __future__ import annotations
 
-from xhs_agent.extract.line_questions import extract_question_lines, should_run_ocr
+from xhs_agent.crawl.candidate_filter import hard_excluded
+from xhs_agent.extract.line_questions import split_to_candidate_lines, should_run_ocr
 
 
 class ExtractNode:
-    def __init__(self, ocr) -> None:
+    def __init__(self, ocr, llm_client) -> None:
         self._ocr = ocr
+        self._llm = llm_client
 
     def run(self, state) -> None:
         extracted = []
         for item in state.raw_posts:
-            question_lines = extract_question_lines(item["body_text"])
-            if should_run_ocr(question_lines) and item.get("image_text"):
-                question_lines = extract_question_lines(item["image_text"])
-            if question_lines:
-                extracted.append({**item, "question_lines": question_lines})
+            # 第一级硬排除：标题/正文命中 Go/C++/前端/产品/运营 → 跳过
+            if hard_excluded(item["title"], item["body_text"]):
+                continue
+
+            candidate_lines = split_to_candidate_lines(item["body_text"])
+            if should_run_ocr(candidate_lines) and item.get("image_text"):
+                ocr_lines = split_to_candidate_lines(item["image_text"])
+                candidate_lines.extend(ocr_lines)
+
+            questions = self._llm.extract_questions(candidate_lines)
+            if questions:
+                extracted.append({**item, "question_lines": questions})
         state.extracted_posts = extracted
 ```
 
@@ -1496,7 +2020,7 @@ class ExtractNode:
 from __future__ import annotations
 
 from xhs_agent.crawl.candidate_filter import is_candidate_post
-from xhs_agent.crawl.html_extract import extract_post_detail
+from xhs_agent.models import RawPost
 
 
 class ClassifyNode:
@@ -1511,12 +2035,13 @@ class ClassifyNode:
         for item in state.extracted_posts:
             if not is_candidate_post(item["title"], item["body_text"]):
                 continue
-            enriched = self._enricher.enrich(
-                extract_post_detail(
-                    f"<div class='title'>{item['title']}</div><div class='content'>{''.join(f'<p>{q}</p>' for q in item['question_lines'])}</div>"
-                ),
-                post_questions=item["question_lines"],
+            # 直接构造 RawPost，不走 HTML 解析绕路
+            post = RawPost(
+                post_id=item["post_id"],
+                title=item["title"],
+                body_text=item["body_text"],
             )
+            enriched = self._enricher.enrich(post, post_questions=item["question_lines"])
             self._repository.save_post(state.target_date, enriched)
             enriched_posts.append(enriched)
             top_posts.append(
@@ -1565,11 +2090,39 @@ class AnswerNode:
 # src/xhs_agent/nodes/report_node.py
 from __future__ import annotations
 
+from xhs_agent.process.stats import compute_observation_lines, compute_trend_lines
 from xhs_agent.report.render import render_daily_report
 
 
 class ReportNode:
+    def __init__(self, repository) -> None:
+        self._repository = repository
+
     def run(self, state) -> None:
+        # 生成趋势分析
+        state.trend_lines = compute_trend_lines(
+            state.target_date,
+            state.top_tags,
+            self._repository,
+        )
+        # 生成重点观察
+        company_summary = self._repository.post_company_summary_for_date(state.target_date)
+        state.observation_lines = compute_observation_lines(
+            state.target_date,
+            company_summary,
+            state.top_tags,
+            self._repository,
+        )
+        # 保存每日快照
+        self._repository.save_daily_snapshot(
+            target_date=state.target_date,
+            candidate_count=len(state.raw_posts),
+            valid_count=len(state.enriched_posts),
+            question_count=len(state.answer_cards),
+            top_tags=state.top_tags[:10],
+            top_questions=[card["question"] for card in state.answer_cards[:8]],
+        )
+
         state.report_markdown = render_daily_report(
             target_date=state.target_date,
             top_posts=state.top_posts,
@@ -1577,6 +2130,8 @@ class ReportNode:
             answered_questions=state.answer_cards,
             trend_lines=state.trend_lines,
             observation_lines=state.observation_lines,
+            candidate_count=len(state.raw_posts),
+            valid_count=len(state.enriched_posts),
         )
 ```
 
@@ -1614,6 +2169,7 @@ class DailyOrchestrator:
             "observation_lines": state.observation_lines,
             "warnings": state.warnings,
             "markdown": state.report_markdown,
+            "url": state.report_url,
         }
 ```
 
@@ -1621,8 +2177,11 @@ class DailyOrchestrator:
 # src/xhs_agent/runner.py
 from __future__ import annotations
 
+import logging
+
 from xhs_agent.config import build_target_window
-from xhs_agent.report.render import render_daily_report
+
+logger = logging.getLogger("xhs_agent")
 
 
 class DailyRunner:
@@ -1634,24 +2193,42 @@ class DailyRunner:
 
     def run(self, run_date: str) -> dict:
         _, _, target_date = build_target_window(self._timezone_name, run_date)
-        posts = self._crawler.fetch_posts_for_date(target_date)
+
+        # 阶段 1：抓取
+        try:
+            posts = self._crawler.fetch_posts_for_date(target_date)
+        except Exception as e:
+            logger.error("crawl failed for %s: %s", target_date, e)
+            return {
+                "target_date": target_date,
+                "top_posts": [],
+                "top_tags": [],
+                "answered_questions": [],
+                "trend_lines": [],
+                "observation_lines": [],
+                "warnings": ["crawl_failed"],
+                "markdown": "",
+            }
+
+        # 阶段 2：处理
         result = self._pipeline.process_posts(posts, target_date)
-        markdown = render_daily_report(
-            target_date=target_date,
-            top_posts=result["top_posts"],
-            top_tags=result["top_tags"],
-            answered_questions=result["answered_questions"],
-            trend_lines=result["trend_lines"],
-            observation_lines=result["observation_lines"],
-        )
         result["target_date"] = target_date
-        result["markdown"] = markdown
         result.setdefault("warnings", [])
-        if self._publisher is not None:
-            self._publisher.publish_markdown(
-                title=f"{target_date} 小红书后端 / AI 应用开发面经日报",
-                markdown=markdown,
-            )
+        result.setdefault("markdown", "")
+
+        # 阶段 3：发布
+        if self._publisher is not None and result["markdown"]:
+            try:
+                pub_result = self._publisher.publish_markdown(
+                    title=f"{target_date} 小红书后端 / AI 应用开发面经日报",
+                    markdown=result["markdown"],
+                )
+                result["url"] = pub_result["url"]
+                logger.info("report published to %s", pub_result["url"])
+            except Exception as e:
+                logger.error("feishu publish failed after retries: %s", e)
+                result["warnings"].append("feishu_publish_failed")
+
         return result
 ```
 
@@ -1660,9 +2237,12 @@ class DailyRunner:
 from __future__ import annotations
 
 import argparse
+import logging
+import sys
+import traceback
 
-from xhs_agent.crawl.browser import BrowserSession
 from xhs_agent.config import Settings
+from xhs_agent.crawl.browser import BrowserSession
 from xhs_agent.llm.client import LlmClient
 from xhs_agent.ocr.image_ocr import ImageOcr
 from xhs_agent.process.enricher import Enricher
@@ -1677,6 +2257,8 @@ from xhs_agent.runner import DailyRunner
 from xhs_agent.storage.db import connect
 from xhs_agent.storage.repository import Repository
 
+logger = logging.getLogger("xhs_agent")
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
@@ -1686,24 +2268,62 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
     settings = Settings()
     parser = build_parser()
     args = parser.parse_args()
-    if args.command == "run-daily":
+
+    if args.command != "run-daily":
+        parser.print_help()
+        sys.exit(1)
+
+    logger.info("starting daily pipeline for run-date=%s", args.run_date)
+    db_path = "data/xhs_agent.db"
+
+    try:
         browser = BrowserSession(settings.xhs_storage_state_path)
         llm = LlmClient(settings.openai_api_key)
-        repository = Repository(connect("data/xhs_agent.db"))
+        repository = Repository(connect(db_path))
         enricher = Enricher(llm)
         orchestrator = DailyOrchestrator(
             crawl_node=CrawlNode(browser),
-            extract_node=ExtractNode(ImageOcr()),
+            extract_node=ExtractNode(ImageOcr(), llm),
             classify_node=ClassifyNode(enricher, repository),
             answer_node=AnswerNode(enricher),
-            report_node=ReportNode(),
+            report_node=ReportNode(repository),
         )
-        publisher = FeishuDocPublisher(settings.feishu_app_id, settings.feishu_app_secret)
+        publisher = FeishuDocPublisher(
+            settings.feishu_app_id, settings.feishu_app_secret, settings.feishu_parent_folder_token,
+        )
+
         runner = DailyRunner(crawler=orchestrator, pipeline=orchestrator, publisher=publisher)
-        runner.run(run_date=args.run_date)
+        with browser:
+            result = runner.run(run_date=args.run_date)
+
+        logger.info("pipeline complete. target_date=%s, posts=%s, questions=%s, warnings=%s",
+                     result["target_date"],
+                     len(result.get("top_posts", [])),
+                     len(result.get("answered_questions", [])),
+                     result.get("warnings", []))
+
+        if result.get("warnings"):
+            for warning in result["warnings"]:
+                logger.warning("pipeline warning: %s", warning)
+
+        if result.get("url"):
+            logger.info("report published: %s", result["url"])
+        else:
+            logger.info("report markdown (not published):\n%s", result.get("markdown", "(empty)")[:500])
+
+    except Exception:
+        logger.error("pipeline failed: %s", traceback.format_exc())
+        # spec 第 15.1 节：抓取失败时发送失败通知
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 - [ ] **步骤 4：运行 runner 测试，再运行完整测试集**
