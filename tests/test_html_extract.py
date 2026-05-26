@@ -22,3 +22,11 @@ def test_extract_post_detail_reads_title_body_and_images():
     assert post.title == "PDD服务端一面"
     assert post.body_text == "项目怎么上线，怎么部署\nnginx和springboot如何通信\n手撕：数组按k分组"
     assert post.image_urls == ["https://cdn.example.com/1.png"]
+
+
+def test_extract_post_detail_handles_unexpected_html_without_crashing():
+    post = extract_post_detail("<html><body>blocked</body></html>")
+
+    assert post.title == ""
+    assert post.body_text == ""
+    assert post.image_urls == []

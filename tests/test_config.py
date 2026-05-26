@@ -1,4 +1,5 @@
 from xhs_agent.config import Settings, build_target_window
+import tomllib
 
 
 def test_build_target_window_uses_previous_day_in_shanghai():
@@ -21,3 +22,10 @@ def test_settings_default_report_values():
     assert settings.report_timezone == "Asia/Shanghai"
     assert settings.report_top_questions == 8
     assert settings.report_top_posts == 6
+
+
+def test_declared_python_version_matches_type_syntax():
+    with open("pyproject.toml", "rb") as handle:
+        project = tomllib.load(handle)["project"]
+
+    assert project["requires-python"] == ">=3.10"

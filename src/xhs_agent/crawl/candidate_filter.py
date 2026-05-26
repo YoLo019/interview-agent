@@ -3,9 +3,9 @@ from __future__ import annotations
 import re
 
 EXCLUDED_PATTERNS = (
-    re.compile(r"\bgolang\b", re.IGNORECASE),
-    re.compile(r"\bgo\b.*\b面试\b", re.IGNORECASE),
-    re.compile(r"\bgolang\b.*\b面经\b", re.IGNORECASE),
+    re.compile(r"golang", re.IGNORECASE),
+    re.compile(r"\bgo\b.*面试", re.IGNORECASE),
+    re.compile(r"\bgo\b.*面经", re.IGNORECASE),
     re.compile(r"\bc\+\+\b", re.IGNORECASE),
     re.compile(r"前端"),
     re.compile(r"产品经理"),
@@ -15,7 +15,7 @@ EXCLUDED_PATTERNS = (
 RECALL_TOKENS = (
     "后端", "服务端", "java", "面经", "一面", "二面", "终面", "手撕",
     "redis", "mysql", "jvm", "rag", "agent", "llm", "mcp",
-    "面试", "面试官", "八股", "校招", "社招",
+    "面试", "面试官", "八股", "校招",
 )
 
 
